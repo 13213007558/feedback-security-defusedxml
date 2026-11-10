@@ -11,6 +11,7 @@ from xml.etree import ElementTree as orig_elementtree
 from xml.etree.ElementTree import Element as ElementBeforeImport
 from xml.sax.saxutils import XMLGenerator
 from xml.sax import SAXParseException
+from xmlrpc import client as xmlrpc_client
 from pyexpat import ExpatError
 
 from defusedxml import ElementTree, minidom, pulldom, sax, xmlrpc, expatreader
@@ -568,7 +569,7 @@ class TestDefusedGzip(DefusedTestCase):
 
         with self.assertRaises(ValueError):
             response = self.get_gzipped(4096)
-            xmlrpc.DefusedGzipDecodedResponse(response, clen - 1)
+            self.decode_response(response, clen - 1)
 
         with self.assertRaises(ValueError):
             response = self.get_gzipped(4096)
@@ -577,6 +578,143 @@ class TestDefusedGzip(DefusedTestCase):
         with self.assertRaises(ValueError):
             response = self.get_gzipped(4096)
             self.decode_response(response, 4095, 8192)
+
+
+@unittest.skipUnless(gzip is not None, "test requires gzip")
+class TestDefusedGzipStreaming(DefusedTestCase):
+    class FakeResponse:
+        """HTTP response stand-in that only permits bounded reads."""
+
+        def __init__(self, data, fail_after=None):
+            self._data = data
+            self._pos = 0
+            self._fail_after = fail_after
+            self.closed = False
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                raise AssertionError("unbounded read from response")
+            if self._fail_after is not None and self._pos >= self._fail_after:
+                raise IOError("simulated connection failure")
+            end = min(self._pos + size, len(self._data))
+            data = self._data[self._pos : end]
+            self._pos = end
+            return data
+
+        def close(self):
+            self.closed = True
+
+    def gzip_member(self, data):
+        f = io.BytesIO()
+        with gzip.GzipFile(mode="wb", fileobj=f) as gzf:
+            gzf.write(data)
+        return f.getvalue()
+
+    def decode(self, response, readlength=1024, **kwargs):
+        dec = xmlrpc.DefusedGzipDecodedResponse(response, **kwargs)
+        acc = []
+        while True:
+            data = dec.read(readlength)
+            if not data:
+                break
+            acc.append(data)
+        dec.close()
+        return b"".join(acc)
+
+    def test_multi_member(self):
+        parts = [b"first ", b"second ", b"third"]
+        data = b"".join(self.gzip_member(part) for part in parts)
+        response = self.FakeResponse(data)
+        self.assertEqual(self.decode(response, readlength=3), b"".join(parts))
+        self.assertTrue(response.closed)
+
+    def test_small_compressed_large_output(self):
+        data = self.gzip_member(b"d" * (1024 * 1024))
+        self.assertLess(len(data), 4096)
+        response = self.FakeResponse(data)
+        with self.assertRaises(ValueError):
+            self.decode(response, max_output=4096)
+        self.assertTrue(response.closed)
+
+    def test_exact_limits(self):
+        payload = b"d" * 4096
+        data = self.gzip_member(payload)
+        response = self.FakeResponse(data)
+        result = self.decode(
+            response, readlength=7, max_input=len(data), max_output=len(payload)
+        )
+        self.assertEqual(result, payload)
+
+    def test_chunked_reads_share_budget(self):
+        data = self.gzip_member(b"d" * 100)
+        response = self.FakeResponse(data)
+        with self.assertRaises(ValueError):
+            self.decode(response, readlength=3, max_output=99)
+
+    def test_io_error_midway(self):
+        data = self.gzip_member(b"d" * 4096)
+        response = self.FakeResponse(data, fail_after=len(data) // 2)
+        with self.assertRaises(IOError):
+            self.decode(response)
+        self.assertTrue(response.closed)
+
+    def test_truncated_member(self):
+        data = self.gzip_member(b"d" * 4096)
+        response = self.FakeResponse(data[:-5])
+        with self.assertRaises(EOFError):
+            self.decode(response)
+        self.assertTrue(response.closed)
+
+    def test_bad_crc(self):
+        data = bytearray(self.gzip_member(b"d" * 4096))
+        data[-5] ^= 0xFF
+        response = self.FakeResponse(bytes(data))
+        with self.assertRaises(gzip.BadGzipFile):
+            self.decode(response)
+        self.assertTrue(response.closed)
+
+    def test_trailing_garbage(self):
+        data = self.gzip_member(b"d" * 4096) + b"not gzip"
+        response = self.FakeResponse(data)
+        with self.assertRaises(gzip.BadGzipFile):
+            self.decode(response)
+        self.assertTrue(response.closed)
+
+    def test_read_conventions(self):
+        payload = b"d" * 100
+        response = self.FakeResponse(self.gzip_member(payload))
+        dec = xmlrpc.DefusedGzipDecodedResponse(response)
+        self.assertEqual(dec.read(0), b"")
+        self.assertEqual(dec.read(10), payload[:10])
+        self.assertEqual(dec.read(), payload[10:])
+        self.assertEqual(dec.read(), b"")
+        self.assertEqual(dec.read(1), b"")
+        dec.close()
+        self.assertTrue(response.closed)
+
+    def test_close_owns_response(self):
+        response = self.FakeResponse(self.gzip_member(b"d" * 4096))
+        dec = xmlrpc.DefusedGzipDecodedResponse(response)
+        dec.read(1)
+        dec.close()
+        self.assertTrue(response.closed)
+
+    def test_xmlrpc_unmarshal(self):
+        params = ({"answer": 42, "text": "hello", "list": [1, 2, 3]},)
+        payload = xmlrpc_client.dumps(params, methodresponse=True).encode("utf-8")
+        response = self.FakeResponse(self.gzip_member(payload))
+        dec = xmlrpc.DefusedGzipDecodedResponse(response)
+        unmarshaller = xmlrpc_client.Unmarshaller()
+        parser = xmlrpc.DefusedExpatParser(unmarshaller)
+        while True:
+            chunk = dec.read(7)
+            if not chunk:
+                break
+            parser.feed(chunk)
+        parser.close()
+        dec.close()
+        self.assertEqual(unmarshaller.close(), params)
+        self.assertTrue(response.closed)
 
 
 def test_main():
@@ -591,6 +729,7 @@ def test_main():
         TestDefusedLxml,
         TestXmlRpc,
         TestDefusedGzip,
+        TestDefusedGzipStreaming,
     ]
     for c in cls:
         suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(c))

@@ -1,6 +1,21 @@
 Changelog
 =========
 
+defusedxml 0.8.1
+----------------
+
+*Release date: not released yet*
+
+- ``defusedxml.xmlrpc.DefusedGzipDecodedResponse`` now decompresses
+  gzip-encoded XML-RPC responses as a bounded stream instead of
+  buffering the whole compressed response in memory first. Compressed
+  input and decompressed output are limited separately
+  (``max_input``/``max_output``, both defaulting to the legacy
+  ``limit``/``MAX_DATA``), counted cumulatively across concatenated
+  gzip members. The decoder takes ownership of the underlying
+  response and closes it on close, error, or exceeded budget.
+
+
 defusedxml 0.8.0
 ----------------
 
