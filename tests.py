@@ -20,6 +20,7 @@ from defusedxml import (
     EntitiesForbidden,
     ExternalReferenceForbidden,
     NotSupportedError,
+    StrictParserPolicyError,
 )
 
 from xml.etree.ElementTree import Element as ElementAfterImport
@@ -579,6 +580,309 @@ class TestDefusedGzip(DefusedTestCase):
             self.decode_response(response, 4095, 8192)
 
 
+class _SpoofedBooleanParser(object):
+    """Look-alike carrying same-named boolean flags but no real hardening."""
+
+    def __init__(self, forbid_dtd=False, forbid_entities=True,
+                 forbid_external=True):
+        self.forbid_dtd = forbid_dtd
+        self.forbid_entities = forbid_entities
+        self.forbid_external = forbid_external
+
+
+class StrictModeTestCase(DefusedTestCase):
+    """Strict mode must not let a custom parser silently downgrade defenses."""
+
+    simple_bytes = b"<root><tag>text</tag></root>"
+    simple_text = "<root><tag>text</tag></root>"
+
+    def hardened_etree_parser(self, **kwargs):
+        return ElementTree.DefusedXMLParser(
+            target=orig_elementtree.TreeBuilder(), **kwargs
+        )
+
+    # ---- ElementTree: plain stdlib parser -------------------------------
+
+    def test_etree_plain_parser_rejected_parse(self):
+        plain = orig_elementtree.XMLParser()
+        with mock.patch("builtins.open") as mopen:
+            with self.assertRaises(StrictParserPolicyError):
+                ElementTree.parse(
+                    self.xml_simple, parser=plain, strict=True
+                )
+            self.assertFalse(mopen.called)
+
+    def test_etree_plain_parser_rejected_iterparse(self):
+        plain = orig_elementtree.XMLParser()
+        with mock.patch("builtins.open") as mopen:
+            with self.assertRaises(StrictParserPolicyError):
+                list(
+                    ElementTree.iterparse(
+                        self.xml_simple, parser=plain, strict=True
+                    )
+                )
+            self.assertFalse(mopen.called)
+
+    def test_etree_plain_parser_rejected_from_stream(self):
+        plain = orig_elementtree.XMLParser()
+        stream = io.BytesIO(self.simple_bytes)
+        with self.assertRaises(StrictParserPolicyError):
+            ElementTree.parse(stream, parser=plain, strict=True)
+        # rejected before any byte was consumed
+        self.assertEqual(stream.tell(), 0)
+
+    # ---- ElementTree: spoofed boolean attributes ------------------------
+
+    def test_etree_spoofed_parser_rejected(self):
+        spoof = _SpoofedBooleanParser()
+        with self.assertRaises(StrictParserPolicyError):
+            ElementTree.parse(
+                io.BytesIO(self.simple_bytes), parser=spoof, strict=True
+            )
+
+    def test_etree_spoofed_iterparse_rejected(self):
+        spoof = _SpoofedBooleanParser()
+        with self.assertRaises(StrictParserPolicyError):
+            list(
+                ElementTree.iterparse(
+                    io.BytesIO(self.simple_bytes), parser=spoof, strict=True
+                )
+            )
+
+    # ---- ElementTree: hardened parser accepted --------------------------
+
+    def test_etree_hardened_parser_accepted(self):
+        parser = self.hardened_etree_parser()
+        tree = ElementTree.parse(
+            io.BytesIO(self.simple_bytes), parser=parser, strict=True
+        )
+        self.assertEqual(tree.getroot().tag, "root")
+
+    def test_etree_hardened_iterparse_accepted(self):
+        parser = self.hardened_etree_parser()
+        events = list(
+            ElementTree.iterparse(
+                io.BytesIO(self.simple_bytes), parser=parser, strict=True
+            )
+        )
+        self.assertTrue(events)
+
+    def test_etree_hardened_with_custom_target(self):
+        # legitimate integration: custom target + verified hardened parser
+        target = orig_elementtree.TreeBuilder()
+        parser = ElementTree.DefusedXMLParser(target=target)
+        tree = ElementTree.parse(
+            io.BytesIO(self.simple_bytes), parser=parser, strict=True
+        )
+        self.assertEqual(tree.getroot().find("tag").text, "text")
+
+    def test_etree_policy_mismatch_rejected(self):
+        # parser hardened without DTD protection but strict call demands it
+        parser = self.hardened_etree_parser(forbid_dtd=False)
+        with self.assertRaises(StrictParserPolicyError):
+            ElementTree.parse(
+                io.BytesIO(self.simple_bytes),
+                parser=parser,
+                strict=True,
+                forbid_dtd=True,
+            )
+
+    def test_etree_stripped_handlers_rejected(self):
+        # correct boolean flags but protection removed from the expat slots
+        parser = self.hardened_etree_parser()
+        parser.parser.EntityDeclHandler = None
+        self.assertTrue(parser.forbid_entities)
+        with self.assertRaises(StrictParserPolicyError):
+            ElementTree.parse(
+                io.BytesIO(self.simple_bytes), parser=parser, strict=True
+            )
+
+    def test_etree_default_non_strict_keeps_legacy_trust(self):
+        # without strict, a plain custom parser keeps working as before
+        plain = orig_elementtree.XMLParser()
+        tree = ElementTree.parse(
+            io.BytesIO(self.simple_bytes), parser=plain
+        )
+        self.assertEqual(tree.getroot().tag, "root")
+
+    def test_etree_strict_external_failure_raises_security_exception(self):
+        # external/entity failure must surface the security exception, not a
+        # swallowed, incomplete document
+        data = self.get_content(self.xml_external)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        parser = self.hardened_etree_parser(forbid_entities=False)
+        with self.assertRaises(
+            (ExternalReferenceForbidden, EntitiesForbidden)
+        ):
+            ElementTree.parse(
+                io.BytesIO(data),
+                parser=parser,
+                strict=True,
+                forbid_entities=False,
+            )
+
+
+class StrictSaxModeTestCase(DefusedTestCase):
+    """Strict verification for the SAX-based pull DOM / minidom adapters."""
+
+    simple_text = "<root><tag>text</tag></root>"
+
+    def test_plain_sax_parser_rejected_pulldom_string(self):
+        from xml.sax.expatreader import ExpatParser
+
+        with self.assertRaises(StrictParserPolicyError):
+            pulldom.parseString(
+                self.simple_text, parser=ExpatParser(), strict=True
+            )
+
+    def test_spoofed_sax_parser_rejected(self):
+        with self.assertRaises(StrictParserPolicyError):
+            pulldom.parseString(
+                self.simple_text,
+                parser=_SpoofedBooleanParser(),
+                strict=True,
+            )
+
+    def test_hardened_sax_parser_accepted_fresh(self):
+        # pristine parser lazily builds its expat object; verify may reset it
+        parser = expatreader.create_parser()
+        self.assertIsNone(parser._parser)
+        events = list(
+            pulldom.parseString(
+                self.simple_text, parser=parser, strict=True
+            )
+        )
+        self.assertTrue(events)
+
+    def test_used_sax_parser_is_not_reset_during_verification(self):
+        parser = expatreader.create_parser()
+        list(pulldom.parseString(self.simple_text, parser=parser))
+        expat_object = parser._parser
+        # strict verification on the shared, already-used parser must retain
+        # its expat object (no reset) and still succeed
+        events = list(
+            pulldom.parseString(
+                self.simple_text, parser=parser, strict=True
+            )
+        )
+        self.assertIs(parser._parser, expat_object)
+        self.assertTrue(events)
+
+    def test_fresh_sax_parser_reset_installs_defused_handlers(self):
+        from defusedxml.sax import verify_strict_parser
+
+        parser = expatreader.create_parser()
+        self.assertIsNone(parser._parser)
+        verify_strict_parser(parser, False, True, True)
+        # the one-time reset installs the enforcing external handler
+        self.assertEqual(
+            parser._parser.ExternalEntityRefHandler,
+            parser.defused_external_entity_ref_handler,
+        )
+
+    def test_closed_sax_parser_can_be_reverified(self):
+        from defusedxml.sax import verify_strict_parser
+
+        parser = expatreader.create_parser()
+        list(pulldom.parseString(self.simple_text, parser=parser))
+        # closing the stream drops the expat object; reverify must reset and
+        # re-install the handlers rather than fail
+        self.assertIsNone(parser._parser)
+        verify_strict_parser(parser, False, True, True)
+        self.assertEqual(
+            parser._parser.ExternalEntityRefHandler,
+            parser.defused_external_entity_ref_handler,
+        )
+
+    def test_hardened_sax_policy_mismatch_rejected(self):
+        parser = expatreader.create_parser(forbid_external=False)
+        with self.assertRaises(StrictParserPolicyError):
+            pulldom.parseString(
+                self.simple_text,
+                parser=parser,
+                strict=True,
+                forbid_external=True,
+            )
+
+    def test_pulldom_rejected_before_file_open(self):
+        from xml.sax.expatreader import ExpatParser
+
+        with mock.patch("builtins.open") as mopen:
+            with self.assertRaises(StrictParserPolicyError):
+                pulldom.parse(
+                    self.xml_simple, parser=ExpatParser(), strict=True
+                )
+            self.assertFalse(mopen.called)
+
+    def test_pulldom_rejected_before_network_fetch(self):
+        from xml.sax import InputSource
+        from xml.sax.expatreader import ExpatParser
+
+        source = InputSource()
+        source.setSystemId("http://127.0.9.1:9/never-fetched.xml")
+        with mock.patch("urllib.request.urlopen") as murl, mock.patch(
+            "builtins.open"
+        ) as mopen:
+            with self.assertRaises(StrictParserPolicyError):
+                pulldom.parse(source, parser=ExpatParser(), strict=True)
+            self.assertFalse(murl.called)
+            self.assertFalse(mopen.called)
+
+    def test_minidom_hardened_parser_accepted(self):
+        doc = minidom.parseString(
+            self.simple_text,
+            parser=expatreader.create_parser(),
+            strict=True,
+        )
+        self.assertEqual(doc.documentElement.tagName, "root")
+
+    def test_minidom_plain_parser_rejected(self):
+        from xml.sax.expatreader import ExpatParser
+
+        with self.assertRaises(StrictParserPolicyError):
+            minidom.parseString(
+                self.simple_text, parser=ExpatParser(), strict=True
+            )
+
+    def test_minidom_rejected_before_file_open(self):
+        from xml.sax.expatreader import ExpatParser
+
+        with mock.patch("builtins.open") as mopen:
+            with self.assertRaises(StrictParserPolicyError):
+                minidom.parse(
+                    self.xml_simple, parser=ExpatParser(), strict=True
+                )
+            self.assertFalse(mopen.called)
+
+    def test_sax_non_strict_keeps_legacy_trust(self):
+        from xml.sax.expatreader import ExpatParser
+
+        events = list(
+            pulldom.parseString(
+                self.simple_text, parser=ExpatParser()
+            )
+        )
+        self.assertTrue(events)
+
+    def test_sax_strict_external_failure_raises_security_exception(self):
+        parser = expatreader.create_parser(forbid_entities=False)
+        data = self.get_content(self.xml_external)
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        with self.assertRaises(
+            (ExternalReferenceForbidden, EntitiesForbidden)
+        ):
+            list(
+                pulldom.parseString(
+                    data,
+                    parser=parser,
+                    strict=True,
+                    forbid_entities=False,
+                )
+            )
+
+
 def test_main():
     suite = unittest.TestSuite()
     cls = [
@@ -591,6 +895,8 @@ def test_main():
         TestDefusedLxml,
         TestXmlRpc,
         TestDefusedGzip,
+        StrictModeTestCase,
+        StrictSaxModeTestCase,
     ]
     for c in cls:
         suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(c))

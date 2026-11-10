@@ -15,6 +15,7 @@ from .common import (
     EntitiesForbidden,
     ExternalReferenceForbidden,
     NotSupportedError,
+    StrictParserPolicyError,
     _apply_defusing,
 )
 
@@ -65,4 +66,5 @@ __all__ = [
     "EntitiesForbidden",
     "ExternalReferenceForbidden",
     "NotSupportedError",
+    "StrictParserPolicyError",
 ]

@@ -17,7 +17,14 @@ from xml.etree.ElementTree import tostring
 import importlib
 
 
-from .common import DTDForbidden, EntitiesForbidden, ExternalReferenceForbidden
+from .common import (
+    DTDForbidden,
+    EntitiesForbidden,
+    ExternalReferenceForbidden,
+    _check_expat_slots,
+    _verify_policy_flags,
+    _strict_policy_error,
+)
 
 __origin__ = "xml.etree.ElementTree"
 
@@ -119,13 +126,73 @@ class DefusedXMLParser(_XMLParser):
 XMLTreeBuilder = XMLParse = XMLParser = DefusedXMLParser
 
 
-def parse(source, parser=None, forbid_dtd=False, forbid_entities=True, forbid_external=True):
+def _verify_strict_etree_parser(
+    parser, forbid_dtd, forbid_entities, forbid_external
+):
+    """Prove that a caller-supplied ElementTree parser enforces the policy.
+
+    Only an instance of :class:`DefusedXMLParser` (or a subclass) can be
+    verified, because only it exposes the bound hardening callbacks. The
+    boolean policy flags are checked and, as authoritative proof, the
+    underlying pyexpat handler slots are inspected. A plain stdlib
+    ``XMLParser`` or a look-alike carrying same-named boolean attributes is
+    rejected. No state of the parser is mutated.
+    """
+    if not isinstance(parser, DefusedXMLParser):
+        raise _strict_policy_error(
+            "custom parser is not a DefusedXMLParser instance; defusedxml "
+            "cannot prove that it enforces the requested hardening policy",
+            parser,
+            forbid_dtd,
+            forbid_entities,
+            forbid_external,
+        )
+
+    error = _verify_policy_flags(
+        parser, forbid_dtd, forbid_entities, forbid_external
+    )
+    if error is not None:
+        raise error
+
+    # DefusedXMLParser builds its pyexpat parser eagerly in __init__, so the
+    # live handler slots can always be inspected without starting a parse.
+    error = _check_expat_slots(
+        parser.parser, parser, forbid_dtd, forbid_entities, forbid_external
+    )
+    if error is not None:
+        raise error
+
+
+def parse(
+    source,
+    parser=None,
+    forbid_dtd=False,
+    forbid_entities=True,
+    forbid_external=True,
+    strict=False,
+):
+    """Parse a file or file object into an ElementTree.
+
+    When ``parser`` is omitted, a fully hardened :class:`DefusedXMLParser` is
+    created from the ``forbid_*`` flags.
+
+    Passing a custom ``parser`` hands control of hardening to the caller. By
+    default (``strict=False``) the custom parser is trusted as-is for backwards
+    compatibility; the ``forbid_*`` flags are not applied to it. With
+    ``strict=True`` the parser is verified before any input is read and a
+    :class:`~defusedxml.common.StrictParserPolicyError` is raised unless it can
+    be proven to honor the requested policy.
+    """
     if parser is None:
         parser = DefusedXMLParser(
             target=_TreeBuilder(),
             forbid_dtd=forbid_dtd,
             forbid_entities=forbid_entities,
             forbid_external=forbid_external,
+        )
+    elif strict:
+        _verify_strict_etree_parser(
+            parser, forbid_dtd, forbid_entities, forbid_external
         )
     return _parse(source, parser)
 
@@ -137,13 +204,25 @@ def iterparse(
     forbid_dtd=False,
     forbid_entities=True,
     forbid_external=True,
+    strict=False,
 ):
+    """Incrementally parse a file or file object.
+
+    The trust boundary for a custom ``parser`` is the same as for
+    :func:`parse`: with ``strict=True`` the parser must be a verifiably
+    hardened :class:`DefusedXMLParser`, otherwise it is rejected before the
+    source is opened or read.
+    """
     if parser is None:
         parser = DefusedXMLParser(
             target=_TreeBuilder(),
             forbid_dtd=forbid_dtd,
             forbid_entities=forbid_entities,
             forbid_external=forbid_external,
+        )
+    elif strict:
+        _verify_strict_etree_parser(
+            parser, forbid_dtd, forbid_entities, forbid_external
         )
     return _iterparse(source, events, parser)
 

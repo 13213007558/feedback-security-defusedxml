@@ -303,10 +303,47 @@ disallow any access to remote or local resources in external entities or
 DTD and raising an *ExternalReferenceForbidden* exception when a DTD or
 entity references an external resource.
 
+#### Strict mode for custom parsers
+
+`ElementTree.parse()`, `ElementTree.iterparse()`, `pulldom.parse()`,
+`pulldom.parseString()`, `minidom.parse()` and `minidom.parseString()`
+accept a caller-supplied `parser`. The `forbid_*` flags only configure a
+parser that defusedxml creates itself; when you pass your own parser you
+take responsibility for its hardening, and by default (`strict=False`) it
+is used as-is for backwards compatibility.
+
+Pass `strict=True` to make the trust boundary explicit. Before any input
+is read, defusedxml verifies that the parser is one of its own hardened
+parser classes, that the `forbid_*` flags match the requested policy, and
+that the enforcing pyexpat handler slots are actually installed. A plain
+standard-library parser, or any look-alike that merely carries
+same-named boolean attributes, is rejected with
+*StrictParserPolicyError* before a file is opened or a URL is fetched:
+
+```python
+from xml.etree.ElementTree import TreeBuilder
+from defusedxml import ElementTree
+from defusedxml import StrictParserPolicyError
+
+# custom target with a verifiably hardened parser
+parser = ElementTree.DefusedXMLParser(target=TreeBuilder())
+tree = ElementTree.parse(source, parser=parser, strict=True)
+
+# a plain stdlib parser cannot silently downgrade the policy
+try:
+    ElementTree.parse(source, parser=plain_stdlib_parser, strict=True)
+except StrictParserPolicyError:
+    reject_request()
+```
+
+The check never mutates a shared parser and never resets a parser that is
+already parsing. The deprecated `defusedxml.lxml` facade does not support
+strict mode.
+
 ### defusedxml (package)
 
 DefusedXmlException, DTDForbidden, EntitiesForbidden,
-ExternalReferenceForbidden, NotSupportedError
+ExternalReferenceForbidden, NotSupportedError, StrictParserPolicyError
 
 defuse_stdlib() (*experimental*)
 

@@ -6,6 +6,10 @@
 """DEPRECATED Example code for lxml.etree protection
 
 The code has NO protection against decompression bombs.
+
+This deprecated facade does not provide the ``strict`` parser policy mode.
+A custom lxml parser passed to ``parse()`` or ``fromstring()`` is trusted as
+in the standard lxml API.
 """
 from __future__ import print_function, absolute_import
 

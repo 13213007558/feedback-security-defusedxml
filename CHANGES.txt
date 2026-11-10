@@ -6,6 +6,16 @@ defusedxml 0.8.0
 
 *Release date: 2023*
 
+- Add an explicit strict policy mode (``strict=True``) to the parser-
+  injecting entry points ``ElementTree.parse()``,
+  ``ElementTree.iterparse()``, ``pulldom.parse()``,
+  ``pulldom.parseString()``, ``minidom.parse()`` and
+  ``minidom.parseString()``. In strict mode a caller-supplied parser is
+  verified before any input is read; a plain standard-library parser or a
+  look-alike carrying same-named boolean attributes is rejected with
+  ``StrictParserPolicyError`` unless the requested ``forbid_*`` policy can
+  be proven from the installed pyexpat handler slots. The legacy
+  trust-as-is behavior remains the default.
 - Fix testing without lxml
 - Test on 3.13-dev and PyPy 3.9
 

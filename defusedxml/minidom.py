@@ -15,9 +15,22 @@ __origin__ = "xml.dom.minidom"
 
 
 def parse(
-    file, parser=None, bufsize=None, forbid_dtd=False, forbid_entities=True, forbid_external=True
+    file,
+    parser=None,
+    bufsize=None,
+    forbid_dtd=False,
+    forbid_entities=True,
+    forbid_external=True,
+    strict=False,
 ):
-    """Parse a file into a DOM by filename or file object."""
+    """Parse a file into a DOM by filename or file object.
+
+    When a custom ``parser`` is supplied the SAX/pull-DOM path is used. With
+    ``strict=True`` the parser is verified before any file or URL is opened;
+    an unverifiable parser is rejected with
+    :class:`~defusedxml.common.StrictParserPolicyError`. Without ``strict``
+    the custom parser keeps the historical trust-as-is behavior.
+    """
     if parser is None and not bufsize:
         return _expatbuilder.parse(
             file,
@@ -35,14 +48,24 @@ def parse(
                 "forbid_dtd": forbid_dtd,
                 "forbid_entities": forbid_entities,
                 "forbid_external": forbid_external,
+                "strict": strict,
             },
         )
 
 
 def parseString(
-    string, parser=None, forbid_dtd=False, forbid_entities=True, forbid_external=True
+    string,
+    parser=None,
+    forbid_dtd=False,
+    forbid_entities=True,
+    forbid_external=True,
+    strict=False,
 ):
-    """Parse a file into a DOM from a string."""
+    """Parse a file into a DOM from a string.
+
+    A custom ``parser`` is verified before reading the string when
+    ``strict=True``; otherwise it is used as-is for backwards compatibility.
+    """
     if parser is None:
         return _expatbuilder.parseString(
             string,
@@ -59,5 +82,6 @@ def parseString(
                 "forbid_dtd": forbid_dtd,
                 "forbid_entities": forbid_entities,
                 "forbid_external": forbid_external,
+                "strict": strict,
             },
         )
