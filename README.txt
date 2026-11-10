@@ -311,6 +311,36 @@ all stdlib modules with ``defusedxml.defuse_stdlib()``.
    cause surprising side effects. Instead you should use the parsing features
    of defusedxml explicitly.
 
+For a reversible version of the same patch use
+``defusedxml.scope.DefusingScope`` (or the ``defusing_scope()`` factory). It
+applies every patch of ``defuse_stdlib()`` -- including the ``xmlrpc``
+patch -- on ``__enter__`` and restores the exact previous objects on
+``__exit__``::
+
+      >>> from defusedxml.scope import DefusingScope
+      >>> with DefusingScope():
+      ...     # stdlib XML parsers are defused in this block
+      ...     ...
+      ... # previous objects are restored here, even if the block raised
+
+The scope saves the *object identity* of each patched attribute on entry and
+only restores an attribute when it still holds the scope's replacement.
+Nested scopes are supported: an inner scope restores the state it inherited
+and never removes protection that an outer scope still needs. If other code
+modifies a patched attribute while the scope is active, the conflict is
+detected instead of being silently overwritten. With the default
+``on_conflict="raise"`` a ``ScopeConflictError`` is raised; with
+``on_conflict="warn"`` a ``ScopeConflictWarning`` is issued and the foreign
+value is kept. Either way ``DefusingScope.conflicts`` holds
+``ScopeConflict`` records with the original, replacement and current
+objects for investigation.
+
+.. Warning::
+
+   Both ``defuse_stdlib()`` and ``DefusingScope`` modify *process-global*
+   module attributes. The change is visible to every thread in the process;
+   it is not a per-thread or thread-local security policy.
+
 All functions and parser classes accept three additional keyword arguments.
 They return either the same objects as the original functions or compatible
 subclasses.
@@ -335,7 +365,17 @@ defusedxml (package)
 DefusedXmlException, DTDForbidden, EntitiesForbidden,
 ExternalReferenceForbidden, NotSupportedError
 
-defuse_stdlib() (*experimental*)
+defuse_stdlib() (*experimental*, process-global monkey patch, no automatic
+restoration)
+
+defusedxml.scope
+----------------
+
+DefusingScope (context manager with explicit enter()/exit()),
+defusing_scope(), ScopeConflict, ScopeConflictError, ScopeConflictWarning
+
+Reversible, process-global monkey patch with identity-based restoration,
+nesting support and conflict detection. See the section above.
 
 
 defusedxml.cElementTree

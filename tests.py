@@ -21,6 +21,17 @@ from defusedxml import (
     ExternalReferenceForbidden,
     NotSupportedError,
 )
+from defusedxml.scope import (
+    DefusingScope,
+    ScopeConflictError,
+    ScopeConflictWarning,
+    _iter_targets,
+    _active_scopes,
+    _MISSING,
+)
+import xml.etree.ElementTree as stdlib_etree
+import xml.dom.minidom as stdlib_minidom
+import xmlrpc.client as stdlib_xmlrpc_client
 
 from xml.etree.ElementTree import Element as ElementAfterImport
 
@@ -579,6 +590,245 @@ class TestDefusedGzip(DefusedTestCase):
             self.decode_response(response, 4095, 8192)
 
 
+class TestDefusingScope(DefusedTestCase):
+    """Scoped, reversible process-global monkey patching."""
+
+    def setUp(self):
+        # make sure no scope leaks between tests
+        self.assertEqual(_active_scopes, [])
+        self._snapshot = self._snapshot_targets()
+
+    def tearDown(self):
+        # every test must leave the stdlib exactly as it found it
+        self._assert_restored(self._snapshot)
+        self.assertEqual(_active_scopes, [])
+
+    def _snapshot_targets(self):
+        snapshot = {}
+        for stdlib_mod, name, replacement in _iter_targets():
+            snapshot[(stdlib_mod.__name__, name)] = getattr(
+                stdlib_mod, name, _MISSING
+            )
+        return snapshot
+
+    def _assert_restored(self, snapshot):
+        for (module_name, name), original in snapshot.items():
+            stdlib_mod = sys.modules[module_name]
+            current = getattr(stdlib_mod, name, _MISSING)
+            self.assertIs(
+                current,
+                original,
+                "{}.{} was not restored to its original object".format(
+                    module_name, name
+                ),
+            )
+
+    def _assert_all_patched(self, scope):
+        for stdlib_mod, name, replacement in _iter_targets():
+            self.assertIs(
+                getattr(stdlib_mod, name),
+                replacement,
+                "{}.{} was not replaced with its defused object".format(
+                    stdlib_mod.__name__, name
+                ),
+            )
+        self.assertEqual(len(scope._snapshots), len(list(_iter_targets())))
+
+    def test_scope_patches_and_restores_by_identity(self):
+        scope = DefusingScope()
+        self.assertFalse(scope.active)
+        with scope:
+            self.assertTrue(scope.active)
+            self.assertIs(_active_scopes[-1], scope)
+            self._assert_all_patched(scope)
+
+            # the entity declaration sample is rejected while defused
+            with open(self.xml_bomb, "rb") as f:
+                bomb_bytes = f.read()
+            self.assertRaises(
+                EntitiesForbidden, stdlib_etree.fromstring, bomb_bytes
+            )
+            self.assertRaises(
+                EntitiesForbidden, stdlib_minidom.parseString, bomb_bytes
+            )
+
+        self.assertFalse(scope.active)
+        # normal parsing works again after restoration
+        root = stdlib_etree.fromstring(bomb_bytes)
+        self.assertEqual(len(root.text), 640)
+        doc = stdlib_minidom.parseString(bomb_bytes)
+        self.assertEqual(doc.documentElement.tagName, "bomb")
+
+    def test_nested_scopes_keep_outer_protection(self):
+        outer = DefusingScope()
+        inner = DefusingScope()
+        with outer:
+            outer_etree_parse = stdlib_etree.parse
+            with open(self.xml_bomb, "rb") as f:
+                bomb_bytes = f.read()
+            self.assertRaises(
+                EntitiesForbidden, stdlib_etree.fromstring, bomb_bytes
+            )
+            with inner:
+                self.assertEqual(_active_scopes, [outer, inner])
+                self.assertRaises(
+                    EntitiesForbidden, stdlib_etree.fromstring, bomb_bytes
+                )
+            # inner exit must not strip the outer scope's protection
+            self.assertTrue(outer.active)
+            self.assertIs(stdlib_etree.parse, outer_etree_parse)
+            self.assertIs(stdlib_etree.parse, ElementTree.parse)
+            self.assertRaises(
+                EntitiesForbidden, stdlib_etree.fromstring, bomb_bytes
+            )
+            self.assertEqual(_active_scopes, [outer])
+        # outer exit restores the original objects
+        self.assertIsNot(stdlib_etree.parse, ElementTree.parse)
+
+    def test_exception_in_body_still_restores(self):
+        scope = DefusingScope()
+        original_parse = stdlib_etree.parse
+        with self.assertRaises(RuntimeError):
+            with scope:
+                patched_parse = stdlib_etree.parse
+                self.assertIs(patched_parse, ElementTree.parse)
+                raise RuntimeError("boom")
+        self.assertFalse(scope.active)
+        self.assertIs(stdlib_etree.parse, original_parse)
+        self.assertEqual(scope.conflicts, [])
+
+    def test_conflict_raises_and_keeps_third_party_object(self):
+        scope = DefusingScope()
+        third_party = lambda *args, **kwargs: "third-party parser"
+        with self.assertRaises(ScopeConflictError) as ctx:
+            with scope:
+                stdlib_etree.parse = third_party
+        conflict = scope.conflicts
+        self.assertEqual(len(conflict), 1)
+        record = conflict[0]
+        self.assertEqual(record.module_name, "xml.etree.ElementTree")
+        self.assertEqual(record.attribute, "parse")
+        self.assertIs(record.replacement, ElementTree.parse)
+        self.assertIs(record.current, third_party)
+        # the conflicting object must not be overwritten with the snapshot
+        self.assertIs(stdlib_etree.parse, third_party)
+        self.assertIs(ctx.exception.conflicts, conflict)
+        # clean up the third party change, then restoration must be complete
+        stdlib_etree.parse = record.original
+        self._assert_restored(self._snapshot)
+
+    def test_conflict_warn_mode_preserves_other_restorations(self):
+        scope = DefusingScope(on_conflict="warn")
+        third_party = lambda *args, **kwargs: "third-party gzip"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with scope:
+                stdlib_xmlrpc_client.gzip_decode = third_party
+        scope_warnings = [w for w in caught if issubclass(w.category, ScopeConflictWarning)]
+        self.assertEqual(len(scope_warnings), 1)
+        self.assertEqual(len(scope.conflicts), 1)
+        record = scope.conflicts[0]
+        self.assertEqual(
+            (record.module_name, record.attribute),
+            ("xmlrpc.client", "gzip_decode"),
+        )
+        self.assertIs(record.current, third_party)
+        # conflicting target left alone ...
+        self.assertIs(stdlib_xmlrpc_client.gzip_decode, third_party)
+        # ... while every uncontested target is fully restored
+        stdlib_xmlrpc_client.gzip_decode = record.original
+        self._assert_restored(self._snapshot)
+
+    def test_raise_on_conflict_does_not_mask_body_exception(self):
+        scope = DefusingScope()
+        third_party = lambda *args, **kwargs: "third-party parser"
+        with self.assertRaises(RuntimeError):
+            with scope:
+                stdlib_etree.parse = third_party
+                raise RuntimeError("body error wins")
+        # conflict information stays available even though no error was raised
+        self.assertEqual(len(scope.conflicts), 1)
+        self.assertIs(stdlib_etree.parse, third_party)
+        stdlib_etree.parse = scope.conflicts[0].original
+
+    def test_invalid_on_conflict(self):
+        self.assertRaises(ValueError, DefusingScope, on_conflict="explode")
+
+    def test_enter_and_exit_explicitly(self):
+        scope = DefusingScope()
+        self.assertRaises(RuntimeError, scope.exit)
+        scope.enter()
+        try:
+            self.assertTrue(scope.active)
+            self.assertIs(stdlib_xmlrpc_client.FastParser, xmlrpc.DefusedExpatParser)
+        finally:
+            scope.exit()
+        self.assertFalse(scope.active)
+        self.assertRaises(RuntimeError, scope.exit)
+
+    def test_xmlrpc_targets_are_scoped(self):
+        original_fast = stdlib_xmlrpc_client.FastParser
+        original_gzip = stdlib_xmlrpc_client.gzip_decode
+        original_response = stdlib_xmlrpc_client.GzipDecodedResponse
+        with DefusingScope():
+            self.assertIs(
+                stdlib_xmlrpc_client.FastParser, xmlrpc.DefusedExpatParser
+            )
+            self.assertIs(
+                stdlib_xmlrpc_client.gzip_decode, xmlrpc.defused_gzip_decode
+            )
+            self.assertIs(
+                stdlib_xmlrpc_client.GzipDecodedResponse,
+                xmlrpc.DefusedGzipDecodedResponse,
+            )
+            import xmlrpc.server as stdlib_xmlrpc_server
+
+            self.assertIs(
+                stdlib_xmlrpc_server.gzip_decode, xmlrpc.defused_gzip_decode
+            )
+        self.assertIs(stdlib_xmlrpc_client.FastParser, original_fast)
+        self.assertIs(stdlib_xmlrpc_client.gzip_decode, original_gzip)
+        self.assertIs(
+            stdlib_xmlrpc_client.GzipDecodedResponse, original_response
+        )
+
+    def test_scope_factory_returns_scope(self):
+        from defusedxml import defusing_scope as factory
+
+        scope = factory()
+        self.assertIsInstance(scope, DefusingScope)
+        with scope:
+            self.assertIs(stdlib_etree.XMLParser, ElementTree.DefusedXMLParser)
+
+
+class TestPermanentDefuseStdlib(DefusedTestCase):
+    """The legacy permanent monkey patch must keep working and be restorable."""
+
+    def test_defuse_stdlib_is_permanent_and_restorable_via_scope_identity(self):
+        snapshot = {}
+        for stdlib_mod, name, replacement in _iter_targets():
+            snapshot[(stdlib_mod, name)] = getattr(stdlib_mod, name, _MISSING)
+        try:
+            result = defuse_stdlib()
+            self.assertIn(xmlrpc, result)
+            for stdlib_mod, name, replacement in _iter_targets():
+                self.assertIs(getattr(stdlib_mod, name), replacement)
+            with open(self.xml_bomb, "rb") as f:
+                bomb_bytes = f.read()
+            self.assertRaises(
+                EntitiesForbidden, stdlib_etree.fromstring, bomb_bytes
+            )
+        finally:
+            for (stdlib_mod, name), original in snapshot.items():
+                if original is _MISSING:
+                    delattr(stdlib_mod, name)
+                else:
+                    setattr(stdlib_mod, name, original)
+        # ordinary parsing works again after manual restoration
+        root = stdlib_etree.fromstring(bomb_bytes)
+        self.assertEqual(len(root.text), 640)
+
+
 def test_main():
     suite = unittest.TestSuite()
     cls = [
@@ -591,6 +841,8 @@ def test_main():
         TestDefusedLxml,
         TestXmlRpc,
         TestDefusedGzip,
+        TestDefusingScope,
+        TestPermanentDefuseStdlib,
     ]
     for c in cls:
         suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(c))

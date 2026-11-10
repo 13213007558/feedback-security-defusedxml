@@ -1,8 +1,17 @@
 Changelog
 =========
 
-defusedxml 0.8.0
-----------------
+defusedxml 0.8.0 (unreleased)
+-----------------------------
+
+- Add ``defusedxml.scope`` with ``DefusingScope`` and the ``defusing_scope()``
+  factory for reversible, process-global monkey patching of the XML stdlib.
+  The scope records object identities on entry, restores its own changes on
+  normal and exception-driven exits, supports nesting without undoing outer
+  protection, and reports conflicts instead of overwriting changes made by
+  other code (``ScopeConflict``, ``ScopeConflictError``,
+  ``ScopeConflictWarning``). The ``xmlrpc`` patch/unpatch follows the same
+  rules. The permanent ``defuse_stdlib()`` monkey patch remains available.
 
 *Release date: 2023*
 

@@ -17,10 +17,24 @@ from .common import (
     NotSupportedError,
     _apply_defusing,
 )
+from .scope import (
+    DefusingScope,
+    ScopeConflict,
+    ScopeConflictError,
+    ScopeConflictWarning,
+    defusing_scope,
+)
 
 
 def defuse_stdlib():
     """Monkey patch and defuse all stdlib packages
+
+    The monkey patch is a process-global modification: attributes of shared
+    stdlib modules are replaced for *every* thread in the process, not just
+    the calling thread. It is not a per-thread or thread-local security
+    policy, and there is no automatic restoration. For reversible patching
+    with explicit enter/exit behavior use
+    :class:`defusedxml.scope.DefusingScope` instead.
 
     :warning: The monkey patch is an EXPERIMENTAL feature.
     """
@@ -65,4 +79,9 @@ __all__ = [
     "EntitiesForbidden",
     "ExternalReferenceForbidden",
     "NotSupportedError",
+    "DefusingScope",
+    "ScopeConflict",
+    "ScopeConflictError",
+    "ScopeConflictWarning",
+    "defusing_scope",
 ]
